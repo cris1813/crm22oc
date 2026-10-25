@@ -31,6 +31,7 @@ jobs:
           mkdir -p $J $M/res/xml $M/res/values
           sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />#' $M/AndroidManifest.xml
           sed -i 's#</application>#<service android:name=".WaAutoService" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true"><intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter><meta-data android:name="android.accessibilityservice" android:resource="@xml/wa_auto_config" /></service></application>#' $M/AndroidManifest.xml
+          sed -i 's#</application>#<service android:name=".WaListener" android:label="Bodega CRM" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true"><intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter></service></application>#' $M/AndroidManifest.xml
           cat > $M/res/xml/wa_auto_config.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -54,6 +55,7 @@ jobs:
             @Override
             public void onCreate(Bundle b) {
               registerPlugin(WaAutoPlugin.class);
+              registerPlugin(WaAgentPlugin.class);
               super.onCreate(b);
             }
           }
@@ -204,26 +206,215 @@ jobs:
             }
           }
           EOF
-      - name: Llave de firma estable
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p ~/.android
-          if gh release download keystore -p debug.keystore -D ~/.android; then
-            echo "Llave existente"
-          else
-            keytool -genkey -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-            gh release create keystore ~/.android/debug.keystore --title "keystore" --notes "No borrar: llave de firma de la app"
-          fi
-      - name: Compilar APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../BodegaCRM.apk
-      - name: Publicar APK en Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: apk-${{ github.run_number }}
-          name: Bodega CRM ${{ github.run_number }}
-          files: BodegaCRM.apk
+          cat > $J/WaListener.java <<'EOF'
+          package cl.bodega.crm;
+          import android.app.Notification;
+          import android.app.RemoteInput;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.os.Parcelable;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+          import java.io.File;
+          import java.io.FileWriter;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+          import org.json.JSONObject;
+          public class WaListener extends NotificationListenerService {
+            static WaListener inst;
+            static final Map<String, StatusBarNotification> last = new HashMap<>();
+            static final Map<String, String> keyTitle = new HashMap<>();
+            static final Map<String, Long> sent = new HashMap<>();
+            static final Set<String> seen = new HashSet<>();
+            static File inbox(Context c) { return new File(c.getFilesDir(), "inbox.jsonl"); }
+            static boolean wa(String p) { return "com.whatsapp".equals(p) || "com.whatsapp.w4b".equals(p); }
+            static boolean isSelf(String s, String self) {
+              if (s == null) return false;
+              String t = s.trim();
+              if (t.isEmpty()) return false;
+              if (self != null && t.equalsIgnoreCase(self.trim())) return true;
+              return t.equalsIgnoreCase("tú") || t.equalsIgnoreCase("tu") || t.equalsIgnoreCase("you") || t.equalsIgnoreCase("yo");
+            }
+            static String senderOf(Bundle b) {
+              CharSequence c = b.getCharSequence("sender");
+              if (c != null) return c.toString();
+              Object sp = b.get("sender_person");
+              if (sp instanceof Bundle) {
+                CharSequence nm = ((Bundle) sp).getCharSequence("name");
+                if (nm != null) return nm.toString();
+              }
+              return "";
+            }
+            @Override
+            public void onListenerConnected() { inst = this; }
+            @Override
+            public void onListenerDisconnected() { inst = null; }
+            @Override
+            public void onNotificationPosted(StatusBarNotification sbn) {
+              try {
+                String p = sbn.getPackageName();
+                if (!wa(p)) return;
+                Notification n = sbn.getNotification();
+                if ((n.flags & Notification.FLAG_GROUP_SUMMARY) != 0) return;
+                Bundle x = n.extras;
+                if (x.getBoolean("android.isGroupConversation")) return;
+                CharSequence tc = x.getCharSequence(Notification.EXTRA_TITLE);
+                if (tc == null) return;
+                String title = tc.toString();
+                CharSequence sn = x.getCharSequence("android.selfDisplayName");
+                String self = sn == null ? null : sn.toString();
+                boolean titleSelf = isSelf(title, self);
+                ArrayList<String[]> ms = new ArrayList<>();
+                boolean anySender = false;
+                Parcelable[] arr = x.getParcelableArray("android.messages");
+                if (arr != null) {
+                  for (Parcelable pc : arr) {
+                    if (!(pc instanceof Bundle)) continue;
+                    Bundle b = (Bundle) pc;
+                    CharSequence tx = b.getCharSequence("text");
+                    if (tx == null) continue;
+                    String sd = senderOf(b);
+                    if (!sd.isEmpty()) anySender = true;
+                    long tm = b.getLong("time");
+                    if (tm == 0) tm = sbn.getPostTime();
+                    ms.add(new String[] { tx.toString(), String.valueOf(tm), sd });
+                  }
+                }
+                if (ms.isEmpty()) {
+                  if (titleSelf) return;
+                  CharSequence s = x.getCharSequence(Notification.EXTRA_TEXT);
+                  if (s == null) return;
+                  ms.add(new String[] { s.toString(), String.valueOf(sbn.getPostTime()), title });
+                  anySender = true;
+                }
+                String peer = null;
+                if (!titleSelf) {
+                  peer = title;
+                  keyTitle.put(sbn.getKey(), title);
+                } else {
+                  peer = keyTitle.get(sbn.getKey());
+                  for (int i = ms.size() - 1; peer == null && i >= 0; i--) {
+                    String sd = ms.get(i)[2];
+                    if (!sd.isEmpty() && !isSelf(sd, self)) peer = sd;
+                  }
+                }
+                if (peer == null) return;
+                last.put(peer, sbn);
+                long now = System.currentTimeMillis();
+                for (String[] m : ms) {
+                  if (isSelf(m[2], self)) continue;
+                  if (anySender && m[2].isEmpty()) continue;
+                  Long st = sent.get(m[0]);
+                  if (st != null && now - st < 180000) continue;
+                  String mid = m[1] + "|" + m[0].hashCode();
+                  synchronized (WaListener.class) {
+                    if (seen.size() > 800) seen.clear();
+                    if (!seen.add(mid)) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("k", sbn.getKey());
+                    o.put("t", Long.parseLong(m[1]));
+                    o.put("title", peer);
+                    o.put("text", m[0]);
+                    o.put("mid", mid);
+                    o.put("pkg", p);
+                    FileWriter w = new FileWriter(inbox(this), true);
+                    w.write(o.toString() + "\n");
+                    w.close();
+                  }
+                }
+              } catch (Exception e) {}
+            }
+            static boolean matches(StatusBarNotification b, String title) {
+              String kt = keyTitle.get(b.getKey());
+              if (kt != null) return kt.equals(title);
+              Bundle x = b.getNotification().extras;
+              CharSequence tt = x.getCharSequence(Notification.EXTRA_TITLE);
+              if (tt != null && title.equals(tt.toString())) return true;
+              Parcelable[] arr = x.getParcelableArray("android.messages");
+              if (arr != null) {
+                for (Parcelable pc : arr) {
+                  if (pc instanceof Bundle && title.equals(senderOf((Bundle) pc))) return true;
+                }
+              }
+              return false;
+            }
+            static boolean reply(Context c, String title, String text) {
+              try {
+                StatusBarNotification best = null;
+                WaListener s = inst;
+                if (s != null) {
+                  StatusBarNotification[] act = s.getActiveNotifications();
+                  if (act != null) {
+                    for (StatusBarNotification b : act) {
+                      if (!wa(b.getPackageName())) continue;
+                      if ((b.getNotification().flags & Notification.FLAG_GROUP_SUMMARY) != 0) continue;
+                      if (!matches(b, title)) continue;
+                      if (best == null || b.getPostTime() >= best.getPostTime()) best = b;
+                    }
+                  }
+                }
+                if (best == null) best = last.get(title);
+                if (best == null) return false;
+                Notification.Action[] as = best.getNotification().actions;
+                if (as == null) return false;
+                for (Notification.Action a : as) {
+                  RemoteInput[] ris = a.getRemoteInputs();
+                  if (ris == null || ris.length == 0 || a.actionIntent == null) continue;
+                  Intent i = new Intent();
+                  Bundle b2 = new Bundle();
+                  for (RemoteInput r : ris) b2.putCharSequence(r.getResultKey(), text);
+                  RemoteInput.addResultsToIntent(ris, i, b2);
+                  sent.put(text, System.currentTimeMillis());
+                  a.actionIntent.send(c, 0, i);
+                  return true;
+                }
+              } catch (Exception e) {}
+              return false;
+            }
+          }
+          EOF
+          cat > $J/WaAgentPlugin.java <<'EOF'
+          package cl.bodega.crm;
+          import android.content.Intent;
+          import android.provider.Settings;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import org.json.JSONObject;
+          @CapacitorPlugin(name = "WaAgent")
+          public class WaAgentPlugin extends Plugin {
+            @PluginMethod
+            public void enabled(PluginCall call) {
+              String s = Settings.Secure.getString(getContext().getContentResolver(), "enabled_notification_listeners");
+              JSObject o = new JSObject();
+              o.put("on", s != null && s.contains(getContext().getPackageName()));
+              call.resolve(o);
+            }
+            @PluginMethod
+            public void openSettings(PluginCall call) {
+              Intent i = new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS");
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              getContext().startActivity(i);
+              call.resolve();
+            }
+            @PluginMethod
+            public void drain(PluginCall call) {
+              JSArray arr = new JSArray();
+              synchronized (WaListener.class) {
+                File f = WaListener.inbox(getContext());
+                try {
+                  if (f.exists()) {
+                    BufferedReader r = new BufferedReader(new FileReader(f));
+                    String l;
+                    while ((l = r.readLine()) != null) {
+                      try { arr.put(new JSONObject(l)); 
