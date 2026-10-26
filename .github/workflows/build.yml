@@ -417,4 +417,47 @@ jobs:
                     BufferedReader r = new BufferedReader(new FileReader(f));
                     String l;
                     while ((l = r.readLine()) != null) {
-                      try { arr.put(new JSONObject(l)); 
+                      try { arr.put(new JSONObject(l)); } catch (Exception e) {}
+                    }
+                    r.close();
+                    f.delete();
+                  }
+                } catch (Exception e) {}
+              }
+              JSObject o = new JSObject();
+              o.put("items", arr);
+              call.resolve(o);
+            }
+            @PluginMethod
+            public void reply(PluginCall call) {
+              String title = call.getString("title");
+              String text = call.getString("text");
+              JSObject o = new JSObject();
+              o.put("ok", title != null && text != null && WaListener.reply(getContext(), title, text));
+              call.resolve(o);
+            }
+          }
+          EOF
+      - name: Llave de firma estable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ~/.android
+          if gh release download keystore -p debug.keystore -D ~/.android; then
+            echo "Llave existente"
+          else
+            keytool -genkey -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            gh release create keystore ~/.android/debug.keystore --title "keystore" --notes "No borrar: llave de firma de la app"
+          fi
+      - name: Compilar APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../BodegaCRM.apk
+      - name: Publicar APK en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Bodega CRM ${{ github.run_number }}
+          files: BodegaCRM.apk
